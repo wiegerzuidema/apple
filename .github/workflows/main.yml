@@ -1,7 +1,9 @@
-name: MACHINE LOKAAL V3 - VERSIECONTROLE HERSTELD
+name: MACHINE LOKAAL V3 - BOUW VANUIT HOOFDMAP
 
 on:
   workflow_dispatch:
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: read
@@ -10,77 +12,100 @@ jobs:
   ios-lokaal-v3:
     runs-on: macos-15
     timeout-minutes: 40
+
     steps:
-      - name: Broncode ophalen
+      - name: Haal bestanden op
         uses: actions/checkout@v4
 
-      - name: Bevestig nieuwe workflow
+      - name: Controleer lokale app-broncode
+        shell: bash
         run: |
-          echo "HERSTELDE WORKFLOW 2026-10-25 ACTIEF"
+          set -euo pipefail
+          echo "NIEUWE BUILD: LOKAAL V3 VANUIT HOOFDMAP"
           echo "Branch: $GITHUB_REF_NAME"
           echo "Commit: $GITHUB_SHA"
-
-      - name: Controleren of de JUISTE lokale iPhone-app aanwezig is
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -f iPhone/ios/project.yml || { echo '::error::iPhone/ios/project.yml ontbreekt. Upload de hele iPhone-map naar repository root.'; exit 1; }
-          test -f iPhone/ios/MachineRemote/Views.swift || { echo '::error::Views.swift ontbreekt'; exit 1; }
-          test -f iPhone/ios/MachineRemote/Assets.xcassets/AppIcon.appiconset/AppIcon.png || { echo '::error::Geel appicoon ontbreekt'; exit 1; }
-          grep -Fq 'Machine Remote · LOKAAL v3' iPhone/ios/MachineRemote/Views.swift || { echo '::error::Dit is NIET de lokale v3-app. Bouw afgebroken.'; exit 1; }
-          grep -Fq 'nl.wiegerz.machine.remote.localv3' iPhone/ios/project.yml || { echo '::error::Oud bundle-ID gevonden'; exit 1; }
-          if grep -Eq 'struct PairView|Eenmalige koppelcode|Veilig koppelen|/machine/api.php' iPhone/ios/MachineRemote/Views.swift; then
-            echo '::error::Oude koppelcode-interface gevonden. Bouw afgebroken.'
+          for file in project.yml Views.swift Connection.swift MachineRemoteApp.swift AppIcon.png RemoteLogo.png Contents.json 'Contents (1).json' 'Contents (2).json'; do
+            test -f "$file" || { echo "::error file=$file::Bestand ontbreekt in de hoofdmap"; exit 1; }
+          done
+          grep -Fq 'Machine Remote · LOKAAL v3' Views.swift || { echo '::error::Dit is niet het lokale v3-beginscherm'; exit 1; }
+          grep -Fq 'nl.wiegerz.machine.remote.localv3' project.yml || { echo '::error::Verkeerd bundle-ID'; exit 1; }
+          grep -Fq 'http://192.168.4.1/api' Connection.swift || { echo '::error::Lokale verbinding ontbreekt'; exit 1; }
+          if grep -Eq 'struct PairView|Eenmalige koppelcode|Veilig koppelen|/machine/api.php' Views.swift; then
+            echo '::error::Oude koppelcode-interface aangetroffen'
             exit 1
           fi
-          echo 'OK: lokale v3-app zonder koppelcode gevonden'
-          sips -g pixelWidth -g pixelHeight iPhone/ios/MachineRemote/Assets.xcassets/AppIcon.appiconset/AppIcon.png
+          echo "OK: lokale appbroncode zonder koppelcode gevonden"
 
-      - name: XcodeGen installeren
-        run: brew install xcodegen
-
-      - name: Nieuw iOS-project genereren
-        working-directory: iPhone/ios
-        run: xcodegen generate
-
-      - name: Nieuwe iPhone-app compileren
-        run: >-
-          xcodebuild -project iPhone/ios/MachineRemote.xcodeproj -scheme MachineRemote
-          -configuration Release -sdk iphoneos -destination 'generic/platform=iOS'
-          -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
-
-      - name: Identiteit van gebouwde app controleren
+      - name: Maak correcte iOS-mapstructuur
         shell: bash
         run: |
           set -euo pipefail
-          APP=build/Build/Products/Release-iphoneos/MachineRemote.app
-          test -d "$APP" || { echo '::error::Geen .app gegenereerd'; exit 1; }
+          DEST="$GITHUB_WORKSPACE/.ios-build"
+          mkdir -p "$DEST/MachineRemote/Assets.xcassets/AppIcon.appiconset"
+          mkdir -p "$DEST/MachineRemote/Assets.xcassets/RemoteLogo.imageset"
+
+          cp project.yml "$DEST/project.yml"
+          cp MachineRemoteApp.swift Connection.swift Views.swift "$DEST/MachineRemote/"
+          cp Contents.json "$DEST/MachineRemote/Assets.xcassets/Contents.json"
+          cp 'Contents (1).json' "$DEST/MachineRemote/Assets.xcassets/AppIcon.appiconset/Contents.json"
+          cp AppIcon.png "$DEST/MachineRemote/Assets.xcassets/AppIcon.appiconset/AppIcon.png"
+          cp 'Contents (2).json' "$DEST/MachineRemote/Assets.xcassets/RemoteLogo.imageset/Contents.json"
+          cp RemoteLogo.png "$DEST/MachineRemote/Assets.xcassets/RemoteLogo.imageset/RemoteLogo.png"
+
+          echo "Werkmap gemaakt: .ios-build/"
+          find "$DEST" -maxdepth 5 -type f -print | sort
+          sips -g pixelWidth -g pixelHeight "$DEST/MachineRemote/Assets.xcassets/AppIcon.appiconset/AppIcon.png"
+
+      - name: Installeer XcodeGen
+        shell: bash
+        run: |
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          xcodegen --version
+
+      - name: Genereer Xcode-project
+        working-directory: .ios-build
+        run: xcodegen generate
+
+      - name: Compileer lokale iPhone-app
+        run: >-
+          xcodebuild -project .ios-build/MachineRemote.xcodeproj
+          -scheme MachineRemote
+          -configuration Release
+          -sdk iphoneos
+          -destination 'generic/platform=iOS'
+          -derivedDataPath build
+          CODE_SIGNING_ALLOWED=NO
+          CODE_SIGNING_REQUIRED=NO
+          build
+
+      - name: Controleer app en maak IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="build/Build/Products/Release-iphoneos/MachineRemote.app"
+          test -d "$APP" || { echo '::error::Gebouwde app ontbreekt'; exit 1; }
           DISPLAY=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$APP/Info.plist")
           BUNDLE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")
           VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist")
-          echo "Naam: $DISPLAY"; echo "Bundle ID: $BUNDLE"; echo "Versie: $VERSION"
+          echo "Naam: $DISPLAY"
+          echo "Bundle ID: $BUNDLE"
+          echo "Versie: $VERSION"
           test "$DISPLAY" = 'Machine Lokaal v3' || { echo '::error::Onjuiste appnaam'; exit 1; }
           test "$BUNDLE" = 'nl.wiegerz.machine.remote.localv3' || { echo '::error::Onjuist bundle-ID'; exit 1; }
-          echo "App-versie $VERSION wordt geaccepteerd. Appnaam en bundle-ID blijven verplicht gecontroleerd."
+          # De versie kan 1.0 of 3.0.0 zijn; dat blokkeert de compilatie niet.
           mkdir -p dist/Payload
           cp -R "$APP" dist/Payload/
           (cd dist && zip -qry MachineLokaal-v3-unsigned.ipa Payload)
-          cat > dist/CONTROLEER_DIT_EERST.txt <<EOF
-          Correcte app: Machine Lokaal v3
-          Bundle-ID: nl.wiegerz.machine.remote.localv3
-          Versie: $VERSION
-          Geen koppelcode.
-          Startscherm: Machine Remote · LOKAAL v3
-          Adres: http://192.168.4.1/api
-          IPA: MachineLokaal-v3-unsigned.ipa
-          EOF
+          printf 'Machine Lokaal v3\nBundle-ID: %s\nVersie: %s\nLokaal: http://192.168.4.1/api\nGeen koppelcode\n' "$BUNDLE" "$VERSION" > dist/LEES_EERST.txt
 
-      - name: GECONTROLEERDE v3 IPA downloaden
+      - name: Download iPhone-app
         uses: actions/upload-artifact@v4
         with:
-          name: ALLEEN-MACHINE-LOKAAL-V3-IPA
+          name: MACHINE-LOKAAL-V3-IPA
           path: |
             dist/MachineLokaal-v3-unsigned.ipa
-            dist/CONTROLEER_DIT_EERST.txt
+            dist/LEES_EERST.txt
           if-no-files-found: error
           retention-days: 14
